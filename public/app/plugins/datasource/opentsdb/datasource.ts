@@ -13,6 +13,7 @@ export default class OpenTsDatasource extends DataSourceApi<OpenTsdbQuery, OpenT
   basicAuth: any;
   tsdbVersion: any;
   tsdbResolution: any;
+  supportMetrics: any;
   lookupLimit: any;
   tagKeys: any;
 
@@ -31,6 +32,7 @@ export default class OpenTsDatasource extends DataSourceApi<OpenTsdbQuery, OpenT
     this.tsdbVersion = instanceSettings.jsonData.tsdbVersion || 1;
     this.tsdbResolution = instanceSettings.jsonData.tsdbResolution || 1;
     this.lookupLimit = instanceSettings.jsonData.lookupLimit || 1000;
+    this.supportMetrics = true;
     this.tagKeys = {};
 
     this.aggregatorsPromise = null;
@@ -38,22 +40,31 @@ export default class OpenTsDatasource extends DataSourceApi<OpenTsdbQuery, OpenT
   }
 
   // Called once per panel (graph)
-  query(options: DataQueryRequest) {
+  query(options: DataQueryRequest<OpenTsdbQuery>) {
     const start = this.convertToTSDBTime(options.rangeRaw.from, false, options.timezone);
     const end = this.convertToTSDBTime(options.rangeRaw.to, true, options.timezone);
     const qs: any[] = [];
+    const gExps: any[] = [];
 
     _.each(options.targets, target => {
-      if (!target.metric) {
+      if (!target.metric && !target.gexp) {
         return;
       }
-      qs.push(this.convertTargetToQuery(target, options, this.tsdbVersion));
+      if (!target.queryType) {
+        target.queryType = 'metric';
+      }
+      if (target.queryType === 'metric') {
+        qs.push(this.convertTargetToQuery(target, options, this.tsdbVersion));
+      } else if (target.queryType === 'gexp') {
+        gExps.push(this.convertGExpToQuery(target));
+      }
     });
 
     const queries = _.compact(qs);
+    const gExpressions = _.compact(gExps);
 
     // No valid targets, return the empty result to save a round trip.
-    if (_.isEmpty(queries)) {
+    if (_.isEmpty(queries) && _.isEmpty(gExpressions)) {
       return Promise.resolve({ data: [] });
     }
 
@@ -70,22 +81,83 @@ export default class OpenTsDatasource extends DataSourceApi<OpenTsdbQuery, OpenT
       }
     });
 
-    options.targets = _.filter(options.targets, query => {
-      return query.hide !== true;
-    });
+    let queriesPromise;
+    if (queries.length > 0) {
+      queriesPromise = this.performTimeSeriesQuery(queries, start, end).then(response => {
+        // only index into classic 'metrics' queries
+        const tsqTargets = options.targets.filter(target => {
+          return target.queryType === 'metric';
+        });
 
-    return this.performTimeSeriesQuery(queries, start, end).then((response: any) => {
-      const metricToTargetMapping = this.mapMetricsToTargets(response.data, options, this.tsdbVersion);
-      const result = _.map(response.data, (metricData: any, index: number) => {
-        index = metricToTargetMapping[index];
-        if (index === -1) {
-          index = 0;
-        }
-        this._saveTagKeys(metricData);
+        const metricToTargetMapping = this.mapMetricsToTargets(response.data, options, tsqTargets, this.tsdbVersion);
 
-        return this.transformMetricData(metricData, groupByTags, options.targets[index], options, this.tsdbResolution);
+        const result = _.map(response.data, (metricData: any, index: number) => {
+          index = metricToTargetMapping[index];
+          if (index === -1) {
+            index = 0;
+          }
+          this._saveTagKeys(metricData);
+
+          return this.transformMetricData(metricData, groupByTags, tsqTargets[index], options, this.tsdbResolution);
+        });
+        return result;
       });
-      return { data: result };
+    }
+
+    // perform single gExp queries so that we can reliably map targets to results once all the promises are resolved
+    // (/query/gexp can perform combined queries but the result order is not determinate)
+    const gexpPromises: Array<Promise<any>> = [];
+    if (gExpressions.length > 0) {
+      for (let gexpIndex = 0; gexpIndex < gExpressions.length; gexpIndex++) {
+        const gexpPromise = this.performGExpressionQuery(gexpIndex, gExpressions[gexpIndex], start, end, options).then(
+          (response: any) => {
+            // only index into gexp queries
+            const gexpTargets = options.targets.filter(target => {
+              return target.queryType === 'gexp';
+            });
+
+            const gExpTargetIndex = this.mapGExpToTargets(response.config.url);
+
+            const result = _.map(response.data, gexpData => {
+              let index = gExpTargetIndex;
+              if (index === -1) {
+                index = 0;
+              }
+              return this.transformGexpData(gexpData, gexpTargets[index], this.tsdbResolution);
+            });
+
+            return result.filter(value => {
+              return value !== false;
+            });
+          }
+        );
+
+        gexpPromises.push(gexpPromise);
+      }
+    }
+
+    // call all queries into an array and concaternate their data into a return object
+    const tsdbQueryPromises = [queriesPromise].concat(gexpPromises);
+
+    // q.all([]) resolves all promises while keeping order in the return array
+    // (see: https://docs.angularjs.org/api/ng/service/$q#all)
+    return Promise.all(tsdbQueryPromises).then(responses => {
+      let data: any = [];
+
+      // response 0 from queriesPromise
+      const queriesData = responses[0];
+      if (queriesData && queriesData.length > 0) {
+        data = data.concat(queriesData);
+      }
+
+      // response 1+ from gexpPromises
+      for (const gexpData of responses.slice(1)) {
+        data = data.concat(gexpData);
+      }
+
+      return {
+        data: data,
+      };
     });
   }
 
@@ -166,6 +238,24 @@ export default class OpenTsDatasource extends DataSourceApi<OpenTsdbQuery, OpenT
       url: this.url + '/api/query',
       data: reqBody,
     };
+
+    this._addCredentialOptions(options);
+    return getBackendSrv().datasourceRequest(options);
+  }
+
+  // retrieve a single gExp via GET to /api/query/gexp
+  performGExpressionQuery(idx: number, gExp: string, start: any, end: any, globalOptions: any) {
+    let urlParams = '?start=' + start + '&exp=' + gExp + '&gexpIndex=' + idx;
+    urlParams = this.templateSrv.replace(urlParams, globalOptions.scopedVars, 'pipe');
+    const options = {
+      method: 'GET',
+      url: this.url + '/api/query/gexp' + urlParams,
+    };
+
+    // Relative queries (e.g. last hour) don't include an end time
+    if (end) {
+      urlParams = '&end=' + end;
+    }
 
     this._addCredentialOptions(options);
     return getBackendSrv().datasourceRequest(options);
@@ -347,11 +437,29 @@ export default class OpenTsDatasource extends DataSourceApi<OpenTsdbQuery, OpenT
 
   transformMetricData(md: { dps: any }, groupByTags: any, target: any, options: any, tsdbResolution: number) {
     const metricLabel = this.createMetricLabel(md, target, groupByTags, options);
+    const dps = this.getDatapointsAtCorrectResolution(md, tsdbResolution);
+
+    return { target: metricLabel, datapoints: dps };
+  }
+
+  transformGexpData(gExp: string, target: any, tsdbResolution: number) {
+    if (typeof target === 'undefined') {
+      // the metric is hidden
+      return false;
+    }
+
+    const metricLabel = this.createGexpLabel(gExp, target);
+    const dps = this.getDatapointsAtCorrectResolution(gExp, tsdbResolution);
+
+    return { target: metricLabel, datapoints: dps };
+  }
+
+  getDatapointsAtCorrectResolution(result: any, tsdbResolution: number) {
     const dps: any[] = [];
 
     // TSDB returns datapoints has a hash of ts => value.
     // Can't use _.pairs(invert()) because it stringifies keys/values
-    _.each(md.dps, (v: any, k: number) => {
+    _.each(result.dps, (v: any, k: any) => {
       if (tsdbResolution === 2) {
         dps.push([v, k * 1]);
       } else {
@@ -359,7 +467,7 @@ export default class OpenTsDatasource extends DataSourceApi<OpenTsdbQuery, OpenT
       }
     });
 
-    return { target: metricLabel, datapoints: dps };
+    return dps;
   }
 
   createMetricLabel(
@@ -392,6 +500,23 @@ export default class OpenTsDatasource extends DataSourceApi<OpenTsdbQuery, OpenT
     }
 
     return label;
+  }
+
+  createGexpLabel(data: any, target: any) {
+    if (!target.gexpAlias) {
+      return target.gexp;
+    }
+
+    return target.gexpAlias.replace(/\$tag_([a-zA-Z0-9-_\.\/]+)/g, (all: string, m1: string) => data.tags[m1]);
+  }
+
+  convertGExpToQuery(target: any) {
+    // filter out a target if it is 'hidden'
+    if (target.hide === true) {
+      return null;
+    }
+
+    return target.gexp;
   }
 
   convertTargetToQuery(target: any, options: any, tsdbVersion: number) {
@@ -469,7 +594,7 @@ export default class OpenTsDatasource extends DataSourceApi<OpenTsdbQuery, OpenT
     return query;
   }
 
-  mapMetricsToTargets(metrics: any, options: any, tsdbVersion: number) {
+  mapMetricsToTargets(metrics: any, targets: any, options: any, tsdbVersion: number) {
     let interpolatedTagValue, arrTagV;
     return _.map(metrics, metricData => {
       if (tsdbVersion === 3) {
@@ -491,6 +616,18 @@ export default class OpenTsDatasource extends DataSourceApi<OpenTsdbQuery, OpenT
         });
       }
     });
+  }
+
+  mapGExpToTargets(queryUrl: string): number {
+    // extract gexpIndex from URL
+    const regex = /.+gexpIndex=(\d+).*/;
+    const gexpIndex = queryUrl.match(regex);
+
+    if (!gexpIndex) {
+      return -1;
+    }
+
+    return Number(gexpIndex[1]);
   }
 
   convertToTSDBTime(date: any, roundUp: any, timezone: any) {
