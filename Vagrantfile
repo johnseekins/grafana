@@ -16,7 +16,7 @@ Vagrant.configure("2") do |config|
      echo "deb https://dl.yarnpkg.com/debian/ stable main" | tee /etc/apt/sources.list.d/yarn.list
      add-apt-repository -y ppa:longsleep/golang-backports
      apt-get update
-     apt-get install -y build-essential golang-go yarn nodejs ruby ruby-dev rubygems build-essential
+     apt-get install -y build-essential golang-go yarn nodejs ruby ruby-dev rubygems
      gem install --no-document fpm
   SHELL
 end
