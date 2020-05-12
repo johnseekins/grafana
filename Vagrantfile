@@ -6,8 +6,8 @@ Vagrant.configure("2") do |config|
   # config.vm.box_check_update = false
   config.vm.synced_folder ".", "/vagrant_data"
   config.vm.provider :libvirt do |libvirt|
-    libvirt.memory = "2048"
-    libvirt.cpus = 2
+    libvirt.memory = "4096"
+    libvirt.cpus = 4
   end
  
   config.vm.provision "shell", inline: <<-SHELL
@@ -16,6 +16,7 @@ Vagrant.configure("2") do |config|
      echo "deb https://dl.yarnpkg.com/debian/ stable main" | tee /etc/apt/sources.list.d/yarn.list
      add-apt-repository -y ppa:longsleep/golang-backports
      apt-get update
-     apt-get install -y build-essential golang-go yarn nodejs
+     apt-get install -y build-essential golang-go yarn nodejs ruby ruby-dev rubygems build-essential
+     gem install --no-document fpm
   SHELL
 end
